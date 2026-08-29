@@ -1998,7 +1998,10 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        // MTP reuses the Qwen4Exp block helpers while building only its
+        // verification head, without constructing the full trunk.
+        graph(const llama_model & model, const llm_graph_params & params, bool mtp);
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
