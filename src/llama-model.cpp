@@ -1634,7 +1634,16 @@ const float * llama_model::tensor_split() const {
 }
 
 uint32_t llama_model::n_embd_pre_norm() const {
-    return arch == LLM_ARCH_DEEPSEEK4 ? hparams.n_embd * hparams.n_hc : hparams.n_embd;
+    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN4EXP) {
+        return hparams.n_embd * hparams.n_hc;
+    }
+    // gemma4 assistants publish h_pre_norm rows at the backbone (target) dim:
+    // the graph's h_next is the post_projection output (assistant dim -> backbone),
+    // which is what gets re-fed as the next draft step's inp_h.
+    if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        return hparams.n_embd_inp();
+    }
+    return hparams.n_embd;
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -2067,7 +2076,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // attention KV cache for the MTP context instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen35 =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_BAILINGMOE3);
+                    (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3);
                 const bool step35_with_mtp =
                     arch == LLM_ARCH_STEP35 && hparams.nextn_predict_layers > 0;
                 const bool mtp_on_step35 =
