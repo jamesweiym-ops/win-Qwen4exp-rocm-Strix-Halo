@@ -1354,9 +1354,27 @@ jobs:
             mv "$zip_file" "release/$zip_name"
           done
 
-          echo "Moving other artifacts..."
-          mv -v artifact/*.zip release
-          mv -v artifact/*.tar.gz release
+          # nullglob, because these classes are now OPTIONAL. The release used
+          # to gate on all 15 build jobs, so every artifact class was guaranteed
+          # present by the time this ran. It gates on six now, which is the
+          # point — a CUDA or iOS failure must not withhold the AMD artifacts —
+          # but it also means this job can start while those jobs are still
+          # running. An unmatched glob then left the literal "artifact/*.zip"
+          # and mv failed the whole release with "No such file or directory".
+          shopt -s nullglob
+          moved=0
+          for f in artifact/*.zip artifact/*.tar.gz; do
+            mv -v "$f" release/
+            moved=$((moved+1))
+          done
+          echo "moved $moved further artifact(s)"
+          # The gating builds are what must be here. If none of them produced a
+          # file, something is genuinely wrong and shipping an empty release
+          # would be worse than failing.
+          if [ -z "$(ls -A release 2>/dev/null)" ]; then
+            echo "::error::no artifacts in release/ — nothing to publish"
+            exit 1
+          fi
 
       # Metadata strix-build-ai consumes: it embeds the manifest at ITS build
       # time, pins this tag, and verifies each sha256 before extracting. The
