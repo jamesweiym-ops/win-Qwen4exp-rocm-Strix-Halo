@@ -9,7 +9,7 @@ on:
         type: boolean
   push:
     branches:
-      - master
+      - main
     paths: [
       '.github/workflows/release.yml',
       '**/CMakeLists.txt',
@@ -842,7 +842,7 @@ jobs:
         with:
           key: ubuntu-24-sycl-${{ matrix.build }}
           evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build
         id: cmake_build
@@ -1249,7 +1249,7 @@ jobs:
           name: llama-bin-${{ matrix.chip_type }}-openEuler-${{ matrix.arch }}${{ matrix.use_acl_graph == 'on' && '-aclgraph' || '' }}.tar.gz
 
   release:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/main' ) || github.event.inputs.create_release == 'true' }}
 
     # Fine-grant permission
     # https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
@@ -1258,22 +1258,24 @@ jobs:
 
     runs-on: ubuntu-slim
 
+    # Only what this fork actually ships. The other jobs still run on push, but
+    # must not gate the release: a CUDA, SYCL, OpenVINO, Android, iOS or CANN
+    # failure has no bearing on an AMD ROCmFPX artifact, and gating on all 15
+    # meant a single unrelated red build withheld every asset.
+    #
+    # Both backends ship for both operating systems. Vulkan is driver-only and
+    # cheap to obtain; HIP is often faster; which one wins flips by model and
+    # workload, so neither can be the sole artifact. windows-cpu stays because
+    # it is the only source of llama-server.exe - the Vulkan and HIP Windows
+    # zips are composites merged in this job, so dropping it ships Windows
+    # archives with no server binary in them.
     needs:
       - webui-build
       - windows
       - windows-cpu
-      - windows-cuda
-      - windows-sycl
       - windows-hip
       - ubuntu-22-rocm
-      - ubuntu-cpu
       - ubuntu-vulkan
-      - ubuntu-24-openvino
-      - ubuntu-24-sycl
-      - android-arm64
-      - macOS-cpu
-      - ios-xcode-build
-      - openEuler-cann
 
     outputs:
       tag_name: ${{ steps.tag.outputs.name }}
@@ -1333,6 +1335,18 @@ jobs:
           mv -v artifact/*.zip release
           mv -v artifact/*.tar.gz release
 
+      # Metadata strix-build-ai consumes: it embeds the manifest at ITS build
+      # time, pins this tag, and verifies each sha256 before extracting. The
+      # script FAILS on an asset it cannot classify into <os>/<arch>/<backend>
+      # rather than skipping it — a silently absent platform surfaces much
+      # later as "no runtime for your machine", long after the release is out.
+      - name: Generate strixbuild manifest, checksums and arch list
+        run: |
+          ./scripts/make-strixbuild-manifest.sh \
+            release "${{ steps.tag.outputs.name }}" src/llama-arch.cpp
+          echo "--- strixbuild-manifest.json ---"
+          cat release/strixbuild-manifest.json
+
       - name: Create release
         id: create_release
         uses: ggml-org/action-create-release@v1
@@ -1348,39 +1362,39 @@ jobs:
             </details>
 
             **macOS/iOS:**
-            - [macOS Apple Silicon (arm64)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-arm64.tar.gz)
-            - [macOS Apple Silicon (arm64, KleidiAI enabled)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-arm64-kleidiai.tar.gz)
-            - [macOS Intel (x64)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-x64.tar.gz)
-            - [iOS XCFramework](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-xcframework.zip)
+            - [macOS Apple Silicon (arm64)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-arm64.tar.gz)
+            - [macOS Apple Silicon (arm64, KleidiAI enabled)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-arm64-kleidiai.tar.gz)
+            - [macOS Intel (x64)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-macos-x64.tar.gz)
+            - [iOS XCFramework](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-xcframework.zip)
 
             **Linux:**
-            - [Ubuntu x64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-x64.tar.gz)
-            - [Ubuntu arm64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-arm64.tar.gz)
-            - [Ubuntu s390x (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-s390x.tar.gz)
-            - [Ubuntu x64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-x64.tar.gz)
-            - [Ubuntu arm64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-arm64.tar.gz)
-            - [Ubuntu x64 (ROCm 7.2)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-7.2-x64.tar.gz)
-            - [Ubuntu x64 (OpenVINO)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-openvino-${{ needs.ubuntu-24-openvino.outputs.openvino_version }}-x64.tar.gz)
-            - [Ubuntu x64 (SYCL FP32)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-fp32-x64.tar.gz)
-            - [Ubuntu x64 (SYCL FP16)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-fp16-x64.tar.gz)
+            - [Ubuntu x64 (CPU)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-x64.tar.gz)
+            - [Ubuntu arm64 (CPU)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-arm64.tar.gz)
+            - [Ubuntu s390x (CPU)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-s390x.tar.gz)
+            - [Ubuntu x64 (Vulkan)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-x64.tar.gz)
+            - [Ubuntu arm64 (Vulkan)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-vulkan-arm64.tar.gz)
+            - [Ubuntu x64 (ROCm 7.2)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-rocm-7.2-x64.tar.gz)
+            - [Ubuntu x64 (OpenVINO)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-openvino-${{ needs.ubuntu-24-openvino.outputs.openvino_version }}-x64.tar.gz)
+            - [Ubuntu x64 (SYCL FP32)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-fp32-x64.tar.gz)
+            - [Ubuntu x64 (SYCL FP16)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-ubuntu-sycl-fp16-x64.tar.gz)
 
             **Android:**
-            - [Android arm64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-android-arm64.tar.gz)
+            - [Android arm64 (CPU)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-android-arm64.tar.gz)
 
             **Windows:**
-            - [Windows x64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip)
-            - [Windows arm64 (CPU)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-arm64.zip)
-            - [Windows x64 (CUDA 12)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-12.4-x64.zip) - [CUDA 12.4 DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-12.4-x64.zip)
-            - [Windows x64 (CUDA 13)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip) - [CUDA 13.1 DLLs](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-13.1-x64.zip)
-            - [Windows x64 (Vulkan)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip)
-            - [Windows x64 (SYCL)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-sycl-x64.zip)
-            - [Windows x64 (HIP)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-hip-radeon-x64.zip)
+            - [Windows x64 (CPU)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip)
+            - [Windows arm64 (CPU)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-arm64.zip)
+            - [Windows x64 (CUDA 12)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-12.4-x64.zip) - [CUDA 12.4 DLLs](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-12.4-x64.zip)
+            - [Windows x64 (CUDA 13)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip) - [CUDA 13.1 DLLs](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/cudart-llama-bin-win-cuda-13.1-x64.zip)
+            - [Windows x64 (Vulkan)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip)
+            - [Windows x64 (SYCL)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-sycl-x64.zip)
+            - [Windows x64 (HIP)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-win-hip-radeon-x64.zip)
 
             **openEuler:**
-            - [openEuler x86 (310p)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-310p-openEuler-x86.tar.gz)
-            - [openEuler x86 (910b, ACL Graph)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-910b-openEuler-x86-aclgraph.tar.gz)
-            - [openEuler aarch64 (310p)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-310p-openEuler-aarch64.tar.gz)
-            - [openEuler aarch64 (910b, ACL Graph)](https://github.com/ggml-org/llama.cpp/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-910b-openEuler-aarch64-aclgraph.tar.gz)
+            - [openEuler x86 (310p)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-310p-openEuler-x86.tar.gz)
+            - [openEuler x86 (910b, ACL Graph)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-910b-openEuler-x86-aclgraph.tar.gz)
+            - [openEuler aarch64 (310p)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-310p-openEuler-aarch64.tar.gz)
+            - [openEuler aarch64 (910b, ACL Graph)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/llama-${{ steps.tag.outputs.name }}-bin-910b-openEuler-aarch64-aclgraph.tar.gz)
 
       - name: Upload release
         id: upload_release
@@ -1391,8 +1405,18 @@ jobs:
             const path = require('path');
             const fs = require('fs');
             const release_id = '${{ steps.create_release.outputs.id }}';
+            // The three metadata files are assets too. Without them the
+            // previous filter generated strixbuild-manifest.json, archs.txt and
+            // checksums.txt and then uploaded none of them — the tool that
+            // fetches the manifest would 404 against a release that looked
+            // complete.
+            const metadata = new Set([
+              'strixbuild-manifest.json',
+              'checksums.txt',
+              'archs.txt',
+            ]);
             for (let file of await fs.readdirSync('./release')) {
-              if (path.extname(file) === '.zip' || file.endsWith('.tar.gz')) {
+              if (path.extname(file) === '.zip' || file.endsWith('.tar.gz') || metadata.has(file)) {
                 console.log('uploadReleaseAsset', file);
                 await github.rest.repos.uploadReleaseAsset({
                   owner: context.repo.owner,
@@ -1405,7 +1429,7 @@ jobs:
             }
 
   webui-publish:
-    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+    if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/main' ) || github.event.inputs.create_release == 'true' }}
 
     needs:
       - release
