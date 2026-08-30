@@ -45,6 +45,15 @@ fi
 # classify is a hard error: silently dropping it ships a manifest that is
 # quietly missing a platform, and the user discovers it as "no runtime for your
 # machine" long after the release went out.
+# Classify an asset into <os>/<arch>/<backend>, or return 1 for "not a
+# strixbuild target". A release carries far more than this tool consumes —
+# xcframework, openvino, sycl, opencl-adreno, cuda, cann — and those are not
+# errors, they are simply other people's artifacts. Failing on them would kill
+# the release at its final step after an hour of building.
+#
+# What IS a hard error is producing no usable asset at all: that means the
+# naming changed under us and a user would be told "no runtime for your
+# machine" long after the release shipped.
 classify() {
   local f="$1" os arch backend
   case "$f" in
@@ -58,11 +67,14 @@ classify() {
     *-x64.*|*-x64-*)     arch=amd64 ;;
     *)                   return 1 ;;
   esac
+  # Order matters: match the backends this tool can actually run, and reject
+  # the rest explicitly rather than letting a substring win by accident.
   case "$f" in
-    *vulkan*) backend=vulkan ;;
-    *rocm*|*hip*) backend=hip ;;
-    *cpu*) backend=cpu ;;
-    *) return 1 ;;
+    *sycl*|*openvino*|*opencl*|*cann*|*cuda*|*musa*) return 1 ;;
+    *vulkan*)      backend=vulkan ;;
+    *rocm*|*hip*)  backend=hip ;;
+    *cpu*)         backend=cpu ;;
+    *)             return 1 ;;
   esac
   printf '%s/%s/%s' "$os" "$arch" "$backend"
 }
@@ -73,10 +85,10 @@ classify() {
   printf '],\n  "assets": {\n'
   first=1
   for f in *.tar.gz *.zip; do
-    key="$(classify "$f")" || {
-      echo "make-strixbuild-manifest: cannot classify asset '$f' into <os>/<arch>/<backend>" >&2
-      exit 1
-    }
+    if ! key="$(classify "$f")"; then
+      echo "  skip (not a strixbuild target): $f" >&2
+      continue
+    fi
     sum="$(sha256sum "$f" | cut -d' ' -f1)"
     size="$(stat -c%s "$f")"
     [ $first -eq 1 ] || printf ',\n'
@@ -85,6 +97,14 @@ classify() {
   done
   printf '\n  }\n}\n'
 } > strixbuild-manifest.json
+
+if grep -q '"assets": {[[:space:]]*}' strixbuild-manifest.json || ! grep -q '"sha256"' strixbuild-manifest.json; then
+  echo "make-strixbuild-manifest: no asset classified as a strixbuild target." >&2
+  echo "  The release asset naming has changed; strixbuild would tell every user" >&2
+  echo "  'no runtime for your machine'. Assets seen:" >&2
+  ls -1 *.tar.gz *.zip 2>/dev/null | sed 's/^/    /' >&2
+  exit 1
+fi
 
 python3 -c "import json,sys; json.load(open('strixbuild-manifest.json'))" \
   || { echo "make-strixbuild-manifest: emitted invalid JSON" >&2; exit 1; }
