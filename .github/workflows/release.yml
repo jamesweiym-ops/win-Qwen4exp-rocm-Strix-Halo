@@ -441,6 +441,9 @@ jobs:
     runs-on: windows-2025
 
     strategy:
+      # A broken arch must not cancel a healthy one. arm64 failing took x64
+      # down with it, and x64 is the only source of llama-server.exe.
+      fail-fast: false
       matrix:
         include:
           - arch: 'x64'
@@ -486,7 +489,27 @@ jobs:
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          Copy-Item "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\14.44.35112\debug_nonredist\${{ matrix.arch }}\Microsoft.VC143.OpenMP.LLVM\libomp140.${{ matrix.arch == 'x64' && 'x86_64' || 'aarch64' }}.dll" .\build\bin\Release\
+          # The OpenMP runtime path was hardcoded to the Enterprise edition and
+          # to one exact MSVC toolset (14.44.35112). Both drift with the runner
+          # image, and the arm64 runner has neither, so this step failed with
+          # "The system cannot find the path specified" — taking the healthy x64
+          # build down with it through fail-fast, and blocking the release,
+          # because windows-cpu is the only source of llama-server.exe.
+          #
+          # Glob the edition and the version instead of naming them. If the DLL
+          # genuinely is not there, say so and carry on rather than failing the
+          # pack: this same build logged "OpenMP not found" on arm64, so the
+          # library is not part of that artifact to begin with.
+          $arch = "${{ matrix.arch }}"
+          $libName = if ($arch -eq 'x64') { 'libomp140.x86_64.dll' } else { 'libomp140.aarch64.dll' }
+          $pattern = "C:\Program Files\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\debug_nonredist\$arch\Microsoft.VC143.OpenMP.LLVM\$libName"
+          $omp = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($omp) {
+            Write-Host "OpenMP runtime: $($omp.FullName)"
+            Copy-Item $omp.FullName .\build\bin\Release\
+          } else {
+            Write-Host "::warning::$libName not found under any VS 2022 edition; packing without it"
+          }
           7z a -snl llama-bin-win-cpu-${{ matrix.arch }}.zip .\build\bin\Release\*
 
       - name: Upload artifacts
