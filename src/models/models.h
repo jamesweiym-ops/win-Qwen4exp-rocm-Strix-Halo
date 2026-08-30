@@ -2080,12 +2080,16 @@ struct llama_model_step35 : public llama_model_base {
 
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+    ~llama_model_qwen4exp() override;
 
     struct ple_history {
         llama_pos                next_pos = -1;
         std::vector<llama_token> toks;
     };
     mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
+    std::unique_ptr<llama_ple_pager> ple_pager;
+    llama_ple_source ple_source{};
+    mutable bool ple_stats_logged = false;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
