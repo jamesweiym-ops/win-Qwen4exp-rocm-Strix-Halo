@@ -7,6 +7,7 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <mutex>
 
 //
 // base classes
@@ -2089,7 +2090,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
     std::unique_ptr<llama_ple_pager> ple_pager;
     llama_ple_source ple_source{};
-    mutable bool ple_stats_logged = false;
+    mutable std::once_flag ple_stats_once;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -2164,13 +2165,20 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,
                     ggml_tensor * hidden,
+                    ggml_tensor * emb,
                             int   il);
+
+        ggml_tensor * build_ple_input(const llama_memory_hybrid_idx_context * mctx_hyb);
 
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,
                             int   il);
 
         const llama_model & model;
+    };
+
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

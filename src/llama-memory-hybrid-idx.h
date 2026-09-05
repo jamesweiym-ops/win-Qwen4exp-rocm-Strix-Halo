@@ -3,7 +3,18 @@
 #include "llama-memory-hybrid.h"
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
+
+// Host-side predecessors used by Qwen4Exp PLE. They live with a context's
+// memory rather than the shared model, so equal sequence ids in two contexts
+// cannot contaminate one another.
+struct llama_ple_history {
+    llama_pos                next_pos = -1;
+    std::vector<llama_token> toks;
+};
+
+using llama_ple_history_map = std::unordered_map<llama_seq_id, llama_ple_history>;
 
 //
 // llama_memory_hybrid_idx
@@ -80,6 +91,7 @@ public:
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+    llama_ple_history_map & get_ple_histories() const;
 
 private:
     // the indexer cache stores only one key head per layer, so it needs its own hparams
@@ -87,6 +99,7 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+    mutable llama_ple_history_map ple_histories;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -128,6 +141,7 @@ public:
     // nullptr when the model carries no indexer, and for the full and update contexts,
     // which do not drive the sparse-attention graph
     const llama_kv_cache_context * get_idx() const;
+    llama_ple_history_map & get_ple_histories() const;
 
     // streams in the current slot info, matching get_k/get_v's `ns`. 1 if unified.
     uint32_t get_n_stream() const;

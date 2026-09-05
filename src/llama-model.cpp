@@ -36,15 +36,6 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <psapi.h>
-#endif
-
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1469,8 +1460,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(params.ple_storage != LLAMA_PLE_STORAGE_DIRECT,
-                     use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1604,17 +1594,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
-
-#ifdef _WIN32
-    if (params.ple_storage == LLAMA_PLE_STORAGE_DIRECT ||
-        ml.has_lazy_tensor_ranges()) {
-        if (!EmptyWorkingSet(GetCurrentProcess())) {
-            LLAMA_LOG_WARN("PLE pager: EmptyWorkingSet failed with error %lu\n", GetLastError());
-        } else {
-            LLAMA_LOG_INFO("PLE pager: loading-page trim completed\n");
-        }
-    }
-#endif
 
     return true;
 }
@@ -2730,6 +2709,7 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
+    TENSOR_NO_PREFETCH    (llama_model_loader::TENSOR_NO_PREFETCH),
     TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

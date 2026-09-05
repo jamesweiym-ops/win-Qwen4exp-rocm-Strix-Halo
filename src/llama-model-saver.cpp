@@ -280,6 +280,49 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,      hparams.indexer_n_head);
     add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,      hparams.indexer_head_size);
     add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k);
+    if (model->arch == LLM_ARCH_QWEN4EXP) {
+        add_kv(LLM_KV_HYPER_CONNECTION_COUNT,        hparams.n_hc);
+        add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(
+                hparams.attn_compress_ratio.begin(),
+                hparams.attn_compress_ratio.begin() + hparams.n_layer));
+
+        std::vector<uint32_t> recurrent_layers;
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (hparams.is_recurrent(il)) {
+                recurrent_layers.push_back(il);
+            }
+        }
+        add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS, recurrent_layers);
+        if (recurrent_layers.empty()) {
+            add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
+        }
+    }
+    add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,        hparams.hc_low_rank); // qwen4exp
+
+    // the PLE group only means anything whole: write all of it or none
+    if (hparams.ple_n_heads > 0) {
+        std::vector<uint32_t> ple_layers;
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (hparams.is_ple_impl[il]) {
+                ple_layers.push_back(il);
+            }
+        }
+        add_kv(LLM_KV_PLE_LAYERS,            ple_layers);
+        add_kv(LLM_KV_PLE_NGRAM_SIZE,        hparams.ple_ngram_size);
+        add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,   hparams.ple_heads_per_ngram);
+        add_kv(LLM_KV_PLE_CONV_KERNEL,       hparams.ple_conv_kernel);
+        add_kv(LLM_KV_PLE_EOS_TOKEN_ID,      hparams.ple_eos_token_id);
+        add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.ple_head_dim);
+        add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS, std::vector<uint64_t>(
+                hparams.ple_layer_multipliers.begin(),
+                hparams.ple_layer_multipliers.begin() + hparams.ple_ngram_size));
+        add_kv(LLM_KV_PLE_HEAD_OFFSETS,      std::vector<uint64_t>(
+                hparams.ple_head_offsets.begin(),
+                hparams.ple_head_offsets.begin() + hparams.ple_n_heads));
+        add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,  std::vector<uint64_t>(
+                hparams.ple_head_vocab_sizes.begin(),
+                hparams.ple_head_vocab_sizes.begin() + hparams.ple_n_heads));
+    }
 
     const float rope_scaling_factor = hparams.rope_freq_scale_train == 1.0f ? 0.0f : 1.0f/hparams.rope_freq_scale_train;
 

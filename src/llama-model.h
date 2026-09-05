@@ -752,6 +752,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_NOT_REQUIRED;
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
+    const int TENSOR_NO_PREFETCH;
     const int TENSOR_READ_LAZY;
 
     explicit llama_model_base(const llama_model_params & params);
