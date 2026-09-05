@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <mutex>
 
 class llama_memory_hybrid_idx_context;
 
@@ -1981,17 +1982,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
     ~llama_model_qwen4exp() override;
 
-    // PLE predecessors are absent from a decode ubatch, so remember them here
-    // (vLLM's ngram_context). next_pos guards it: a mismatch means the sequence
-    // was reset or rewound, and the hash falls back to EOS padding.
-    struct ple_history {
-        llama_pos                next_pos = -1;
-        std::vector<llama_token> toks;
-    };
-    mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
     std::unique_ptr<llama_ple_pager> ple_pager;
     llama_ple_source ple_source{};
-    mutable bool ple_stats_logged = false;
+    mutable std::once_flag ple_stats_once;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
@@ -2077,7 +2070,10 @@ struct llama_model_qwen4exp : public llama_model_base {
         ggml_tensor * build_ple(
              llm_graph_input_rs * inp,
                     ggml_tensor * hidden,
+                    ggml_tensor * emb,
                             int   il);
+
+        ggml_tensor * build_ple_input(const llama_memory_hybrid_idx_context * mctx_hyb);
 
         // returns pair of qkv, z
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(

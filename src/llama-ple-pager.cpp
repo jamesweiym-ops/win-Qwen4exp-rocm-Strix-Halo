@@ -200,6 +200,7 @@ struct llama_ple_pager::impl {
     size_t buffer_bytes = 0;
     llama_ple_pager_stats stats{};
     mutable std::mutex mutex;
+    std::mutex read_mutex;
 
 #ifdef _WIN32
     struct lane {
@@ -219,6 +220,19 @@ struct llama_ple_pager::impl {
 
     static std::runtime_error win_error(const char * operation, DWORD error = GetLastError()) {
         return std::runtime_error(std::string(operation) + ": " + std::system_category().message((int) error));
+    }
+
+    static std::runtime_error read_size_error(const char * operation, uint64_t expected, uint64_t actual) {
+        return std::runtime_error(
+            std::string(operation) + ": expected " + std::to_string(expected) +
+            " bytes, got " + std::to_string(actual));
+    }
+
+    uint64_t expected_read_bytes(uint64_t offset, uint64_t requested) const {
+        if (offset >= file_bytes) {
+            throw std::runtime_error("PLE direct read starts outside the source file");
+        }
+        return std::min(requested, file_bytes - offset);
     }
 
     void cancel_and_drain() noexcept {
@@ -291,10 +305,7 @@ struct llama_ple_pager::impl {
 
     void probe() {
         const uint64_t probe_offset = align_down(source.tensor_offset, source.alignment);
-        uint64_t probe_end = 0;
-        if (!checked_add_u64(probe_offset, source.alignment, probe_end) || probe_end > file_bytes) {
-            throw std::runtime_error("PLE startup probe is outside the source file");
-        }
+        const uint64_t expected = expected_read_bytes(probe_offset, source.alignment);
 
         auto & lane = lanes.front();
         std::memset(&lane.overlapped, 0, sizeof(lane.overlapped));
@@ -302,19 +313,23 @@ struct llama_ple_pager::impl {
         lane.overlapped.OffsetHigh = (DWORD) (probe_offset >> 32);
         lane.overlapped.hEvent = lane.event;
         ResetEvent(lane.event);
-        DWORD bytes = 0;
-        const BOOL ok = ReadFile(file, arena, (DWORD) source.alignment, &bytes, &lane.overlapped);
+        const BOOL ok = ReadFile(file, arena, (DWORD) source.alignment, nullptr, &lane.overlapped);
         if (!ok && GetLastError() != ERROR_IO_PENDING) {
             throw win_error("PLE startup probe");
         }
-        if (!GetOverlappedResult(file, &lane.overlapped, &bytes, TRUE) || bytes != source.alignment) {
+        DWORD bytes = 0;
+        if (!GetOverlappedResult(file, &lane.overlapped, &bytes, TRUE)) {
             throw win_error("PLE startup probe completion");
+        }
+        if (bytes != expected) {
+            throw read_size_error("PLE startup probe completion", expected, bytes);
         }
     }
 
     void read_plan(const llama_ple_read_plan & plan, uint8_t * compact) {
         std::vector<size_t> arena_offsets(plan.sectors.size(), std::numeric_limits<size_t>::max());
         uint64_t total_read_bytes = 0;
+        uint64_t total_scatter_bytes = 0;
         uint64_t total_reads = 0;
         const auto read_start = std::chrono::steady_clock::now();
 
@@ -339,9 +354,8 @@ struct llama_ple_pager::impl {
                         lane.sector_index = sector_index;
                         lane.buffer_offset = arena_offsets[sector_index];
                         ResetEvent(lane.event);
-                        DWORD bytes = 0;
                         const BOOL ok = ReadFile(file, arena + lane.buffer_offset,
-                            (DWORD) sector.bytes, &bytes, &lane.overlapped);
+                            (DWORD) sector.bytes, nullptr, &lane.overlapped);
                         if (!ok && GetLastError() != ERROR_IO_PENDING) {
                             throw win_error("PLE direct read");
                         }
@@ -352,37 +366,48 @@ struct llama_ple_pager::impl {
                     for (size_t n = 0; n < count; ++n) {
                         auto & lane = lanes[n];
                         DWORD bytes = 0;
-                        if (!GetOverlappedResult(file, &lane.overlapped, &bytes, TRUE) ||
-                            bytes != plan.sectors[lane.sector_index].bytes) {
+                        if (!GetOverlappedResult(file, &lane.overlapped, &bytes, TRUE)) {
                             lane.active = false;
                             throw win_error("PLE direct read completion");
                         }
                         lane.active = false;
+                        const auto & sector = plan.sectors[lane.sector_index];
+                        const uint64_t expected = expected_read_bytes(sector.offset, sector.bytes);
+                        if (bytes != expected) {
+                            throw read_size_error("PLE direct read completion", expected, bytes);
+                        }
                         total_read_bytes += bytes;
                     }
 
-                    for (size_t row_index = 0; row_index < plan.row_spans.size(); ++row_index) {
-                        const auto & span = plan.row_spans[row_index];
-                        uint64_t row_end = 0;
-                        if (!checked_add_u64(span.row_offset, source.row_bytes, row_end)) {
-                            throw std::overflow_error("PLE row scatter overflow");
+                    next += count;
+                }
+
+                const size_t wave_end = wave.sector_begin + wave.sector_count;
+                for (size_t row_index = 0; row_index < plan.row_spans.size(); ++row_index) {
+                    const auto & span = plan.row_spans[row_index];
+                    uint64_t row_end = 0;
+                    if (!checked_add_u64(span.row_offset, source.row_bytes, row_end)) {
+                        throw std::overflow_error("PLE row scatter overflow");
+                    }
+                    const size_t span_end = span.sector_begin + span.sector_count;
+                    const size_t first_sector = std::max(wave.sector_begin, span.sector_begin);
+                    const size_t last_sector = std::min(wave_end, span_end);
+                    for (size_t i = first_sector; i < last_sector; ++i) {
+                        const auto & sector = plan.sectors[i];
+                        uint64_t sector_end = 0;
+                        if (!checked_add_u64(sector.offset, sector.bytes, sector_end)) {
+                            throw std::overflow_error("PLE sector scatter overflow");
                         }
-                        for (size_t i = wave.sector_begin; i < wave.sector_begin + wave.sector_count; ++i) {
-                            const auto & sector = plan.sectors[i];
-                            uint64_t sector_end = 0;
-                            if (!checked_add_u64(sector.offset, sector.bytes, sector_end)) {
-                                throw std::overflow_error("PLE sector scatter overflow");
-                            }
-                            const uint64_t begin = std::max(span.row_offset, sector.offset);
-                            const uint64_t end = std::min(row_end, sector_end);
-                            if (begin < end) {
-                                const size_t destination = row_index * (size_t) source.row_bytes + (size_t) (begin - span.row_offset);
-                                const size_t input = arena_offsets[i] + (size_t) (begin - sector.offset);
-                                std::memcpy(compact + destination, arena + input, (size_t) (end - begin));
-                            }
+                        const uint64_t begin = std::max(span.row_offset, sector.offset);
+                        const uint64_t end = std::min(row_end, sector_end);
+                        if (begin < end) {
+                            const size_t destination = row_index * (size_t) source.row_bytes + (size_t) (begin - span.row_offset);
+                            const size_t input = arena_offsets[i] + (size_t) (begin - sector.offset);
+                            const size_t copy_bytes = (size_t) (end - begin);
+                            std::memcpy(compact + destination, arena + input, copy_bytes);
+                            total_scatter_bytes += copy_bytes;
                         }
                     }
-                    next += count;
                 }
             }
         } catch (...) {
@@ -396,6 +421,7 @@ struct llama_ple_pager::impl {
             std::chrono::steady_clock::now() - read_start).count();
         std::lock_guard<std::mutex> lock(mutex);
         stats.bytes += total_read_bytes;
+        stats.scatter_bytes += total_scatter_bytes;
         stats.reads += total_reads;
         stats.read_us += read_us;
         stats.max_read_us = std::max(stats.max_read_us, read_us);
@@ -451,6 +477,11 @@ std::unique_ptr<llama_ple_pager> llama_ple_pager::open_from_file_id(
         throw impl::win_error("PLE source size query");
     }
     pager_impl->file_bytes = (uint64_t) file_size.QuadPart;
+    uint64_t tensor_end = 0;
+    if (!checked_add_u64(source.tensor_offset, source.tensor_bytes, tensor_end) ||
+        tensor_end > pager_impl->file_bytes) {
+        throw std::runtime_error("PLE direct tensor extent is outside the source file");
+    }
 
     FILE_ALIGNMENT_INFO alignment_info{};
     if (!GetFileInformationByHandleEx(pager_impl->file, FileAlignmentInfo,
@@ -555,6 +586,7 @@ void llama_ple_pager::read_rows(const std::vector<int32_t> & rows, float * outpu
     if (pimpl_->is_mapped()) {
         pimpl_->read_mapped_rows(rows, compact.data());
     } else {
+        std::lock_guard<std::mutex> lock(pimpl_->read_mutex);
         pimpl_->read_plan(plan, compact.data());
     }
     const auto dequant_start = std::chrono::steady_clock::now();

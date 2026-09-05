@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
 
 //
 // llama_memory_hybrid_idx
@@ -139,6 +140,7 @@ void llama_memory_hybrid_idx::clear(bool data) {
     if (mem_idx) {
         mem_idx->clear(data);
     }
+    ple_histories.clear();
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -152,7 +154,39 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
-    return get_mem_attn()->seq_rm(seq_id, p0, p1);
+    if (!get_mem_attn()->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+
+    const llama_pos first = p0 < 0 ? 0 : p0;
+    const llama_pos last  = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+    const auto trim = [&](llama_ple_history & hist) {
+        if (first >= last || hist.next_pos < 0 || hist.toks.empty()) {
+            return;
+        }
+        const llama_pos hist_first = hist.next_pos - (llama_pos) hist.toks.size();
+        if (first >= hist.next_pos || last <= hist_first) {
+            return;
+        }
+        if (last >= hist.next_pos && first > hist_first) {
+            hist.toks.resize((size_t) (first - hist_first));
+            hist.next_pos = first;
+            return;
+        }
+        hist = {};
+    };
+
+    if (seq_id < 0) {
+        for (auto & entry : ple_histories) {
+            trim(entry.second);
+        }
+    } else {
+        const auto it = ple_histories.find(seq_id);
+        if (it != ple_histories.end()) {
+            trim(it->second);
+        }
+    }
+    return true;
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -160,6 +194,16 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
+
+    if (seq_id_src == seq_id_dst) {
+        return;
+    }
+    const auto it = ple_histories.find(seq_id_src);
+    if (it == ple_histories.end()) {
+        ple_histories.erase(seq_id_dst);
+    } else {
+        ple_histories[seq_id_dst] = it->second;
     }
 }
 
@@ -169,6 +213,15 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
     }
+
+    const auto it = ple_histories.find(seq_id);
+    if (it == ple_histories.end()) {
+        ple_histories.clear();
+    } else {
+        llama_ple_history keep = it->second;
+        ple_histories.clear();
+        ple_histories.emplace(seq_id, std::move(keep));
+    }
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -177,6 +230,18 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
     }
+
+    if (shift != 0 && seq_id >= 0) {
+        const auto it = ple_histories.find(seq_id);
+        if (it != ple_histories.end() && it->second.next_pos > 0) {
+            const llama_pos tail_pos = it->second.next_pos - 1;
+            const llama_pos first = p0 < 0 ? 0 : p0;
+            const llama_pos last  = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+            if (first <= tail_pos && tail_pos < last) {
+                it->second.next_pos += shift;
+            }
+        }
+    }
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -184,6 +249,18 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
 
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
+    }
+
+    if (d != 1 && seq_id >= 0) {
+        const auto it = ple_histories.find(seq_id);
+        if (it != ple_histories.end() && it->second.next_pos > 0) {
+            const llama_pos tail_pos = it->second.next_pos - 1;
+            const llama_pos first = p0 < 0 ? 0 : p0;
+            const llama_pos last  = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+            if (first <= tail_pos && tail_pos < last) {
+                it->second.next_pos = tail_pos / d + 1;
+            }
+        }
     }
 }
 
@@ -201,6 +278,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+llama_ple_history_map & llama_memory_hybrid_idx::get_ple_histories() const {
+    return ple_histories;
 }
 
 //
@@ -267,6 +348,11 @@ bool llama_memory_hybrid_idx_context::apply() {
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+}
+
+llama_ple_history_map & llama_memory_hybrid_idx_context::get_ple_histories() const {
+    GGML_ASSERT(mem != nullptr);
+    return mem->get_ple_histories();
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {

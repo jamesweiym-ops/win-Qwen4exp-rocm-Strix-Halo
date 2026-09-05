@@ -60,6 +60,7 @@ struct llama_ple_pager_stats {
     uint64_t sectors = 0;
     uint64_t deduplicated_sectors = 0;
     uint64_t bytes = 0;
+    uint64_t scatter_bytes = 0;
     uint64_t reads = 0;
     uint64_t failures = 0;
     uint64_t read_us = 0;

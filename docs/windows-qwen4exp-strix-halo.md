@@ -33,13 +33,15 @@ requires `--mmap` and activates the mmap-backed PLE path in this branch.
 ## Windows memory behavior
 
 `--tensor-read-lazy on` delays tensor access and avoids eagerly prefetching the
-large PLE tensor. After model loading, this branch automatically performs a
-one-time `EmptyWorkingSet` trim; the log should contain
-`PLE pager: loading-page trim completed`. Windows can still retain file-mapped
-pages in the process working set or standby cache after they are touched.
+large PLE tensor. Both direct and mmap pager modes exclude the PLE file range
+from initial prefetch while retaining normal prefetch for the other weights.
+The loader no longer calls the process-wide `EmptyWorkingSet`, which could evict
+freshly warmed zero-copy weights and unrelated hot pages. Windows can still
+retain file-mapped pages in the process working set or standby cache after they
+are touched.
 
-If the one-time trim is not enough, or a persistent hard working-set ceiling is
-required, apply the optional helper after the server is healthy:
+If a persistent hard working-set ceiling is required after measurement, apply
+the optional helper after the server is healthy:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\set-windows-working-set.ps1 -Port 8080 -MaxGiB 8
@@ -49,6 +51,10 @@ The hard limit is per process and must be applied again after a server restart.
 It reduces resident process pages; it does not reduce committed GPU/UMA memory
 and does not provide a strict SSD-only guarantee. A lower limit can increase PLE
 page faults and reduce prompt-processing speed.
+
+The direct-PLE smoke test records working set by default. Pass
+`-ApplyWorkingSetCap -MaxWorkingSetGiB 6` when the test should explicitly apply
+and validate the optional 6 GiB process cap.
 
 ## Scope and limitations
 
