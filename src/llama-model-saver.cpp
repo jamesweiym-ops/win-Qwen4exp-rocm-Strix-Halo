@@ -447,6 +447,10 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->cls_out);
     add_tensor(model->cls_out_b);
     add_tensor(model->cls_norm);
+    add_tensor(model->per_layer_tok_embd); // qwen4exp
+    add_tensor(model->hc_head_norm);       // qwen4exp
+    add_tensor(model->hc_head_down);       // qwen4exp
+    add_tensor(model->hc_head_up);         // qwen4exp
 
     for (const struct llama_layer & layer : model->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
