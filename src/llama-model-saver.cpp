@@ -17,7 +17,6 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
-        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PLAMO3:
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
@@ -57,6 +56,10 @@ void llama_model_saver::add_kv(const enum llm_kv key, const uint32_t value) {
 
 void llama_model_saver::add_kv(const enum llm_kv key, const int32_t value) {
     gguf_set_val_i32(gguf_ctx, llm_kv(key).c_str(), value);
+}
+
+void llama_model_saver::add_kv(const enum llm_kv key, const uint64_t value) {
+    gguf_set_val_u64(gguf_ctx, llm_kv(key).c_str(), value);
 }
 
 void llama_model_saver::add_kv(const enum llm_kv key, const float value) {
@@ -108,6 +111,8 @@ void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, c
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_INT8, value.data(), n_values);
     } else if (std::is_same<typename Container::value_type, uint32_t>::value) {
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_UINT32, value.data(), n_values);
+    } else if (std::is_same<typename Container::value_type, uint64_t>::value) {
+        gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_UINT64, value.data(), n_values);
     } else if (std::is_same<typename Container::value_type, int32_t>::value) {
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_INT32, value.data(), n_values);
     } else if (std::is_same<typename Container::value_type, float>::value) {
@@ -120,6 +125,7 @@ void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, c
 }
 // instantiate for external usage:
 template void llama_model_saver::add_kv<std::vector<uint32_t>>(const enum llm_kv, const std::vector<uint32_t> &, const bool);
+template void llama_model_saver::add_kv<std::vector<uint64_t>>(const enum llm_kv, const std::vector<uint64_t> &, const bool);
 
 void llama_model_saver::add_kv(const enum llm_kv key, const std::vector<std::string> & value) {
     std::vector<const char *> tmp(value.size());
@@ -286,16 +292,6 @@ void llama_model_saver::add_kv_from_model() {
                 hparams.attn_compress_ratio.begin(),
                 hparams.attn_compress_ratio.begin() + hparams.n_layer));
 
-        std::vector<uint32_t> recurrent_layers;
-        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-            if (hparams.is_recurrent(il)) {
-                recurrent_layers.push_back(il);
-            }
-        }
-        add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS, recurrent_layers);
-        if (recurrent_layers.empty()) {
-            add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
-        }
     }
     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,        hparams.hc_low_rank); // qwen4exp
 
