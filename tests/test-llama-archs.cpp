@@ -369,7 +369,7 @@ static void save_ple_test_model(
     llama_model_saver saver(generated.first.get());
     saver.add_kv_from_model();
     saver.add_tensors_from_model();
-    saver.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,       uint32_t(4));
+    saver.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,       uint32_t(2));
     saver.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,      uint32_t(2));
     saver.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,    std::vector<uint32_t>({0, 0, 0}));
     saver.add_kv(LLM_KV_PLE_LAYERS,                   ple_layers);
@@ -397,14 +397,19 @@ static void save_ple_test_model(
         std::fill_n(static_cast<float *>(tensor->data), ggml_nelements(tensor), 0.01f);
         saver.add_tensor(tensor);
     };
+    // Add the output HC tensors explicitly because the PR98 model saver does
+    // not yet enumerate these Qwen4Exp head tensors.
+    add_f32_tensor("output_hc_norm.weight", 512, 1);
+    add_f16_tensor("output_hc_down.weight", 512, 32);
+    add_f16_tensor("output_hc_up.weight", 32, 512);
     for (uint32_t il : ple_layers) {
         const std::string prefix = "blk." + std::to_string(il) + ".ple_";
-        add_f16_tensor(prefix + "key.weight",        256, 1024);
+        add_f16_tensor(prefix + "key.weight",        256, 512);
         add_f16_tensor(prefix + "value.weight",      256, 256);
-        add_f32_tensor(prefix + "norm_key.weight",   1024, 1);
-        add_f32_tensor(prefix + "norm_query.weight", 1024, 1);
-        add_f32_tensor(prefix + "norm_conv.weight",  1024, 1);
-        add_f32_tensor(prefix + "conv1d.weight",     1, 1024);
+        add_f32_tensor(prefix + "norm_key.weight",   512, 1);
+        add_f32_tensor(prefix + "norm_query.weight", 512, 1);
+        add_f32_tensor(prefix + "norm_conv.weight",  512, 1);
+        add_f32_tensor(prefix + "conv1d.weight",     1, 512);
     }
 
     ggml_tensor * ple = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_Q8_0, 256, table_rows);

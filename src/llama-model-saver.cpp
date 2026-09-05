@@ -114,10 +114,10 @@ void llama_model_saver::add_kv(const enum llm_kv key, const Container & value, c
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_INT8, value.data(), n_values);
     } else if (std::is_same<typename Container::value_type, uint32_t>::value) {
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_UINT32, value.data(), n_values);
-    } else if (std::is_same<typename Container::value_type, int32_t>::value) {
-        gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_INT32, value.data(), n_values);
     } else if (std::is_same<typename Container::value_type, uint64_t>::value) {
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_UINT64, value.data(), n_values);
+    } else if (std::is_same<typename Container::value_type, int32_t>::value) {
+        gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_INT32, value.data(), n_values);
     } else if (std::is_same<typename Container::value_type, float>::value) {
         gguf_set_arr_data(gguf_ctx, llm_kv(key).c_str(), GGUF_TYPE_FLOAT32, value.data(), n_values);
     } else if (std::is_same<Container, std::string>::value) {
@@ -295,16 +295,6 @@ void llama_model_saver::add_kv_from_model() {
                 hparams.attn_compress_ratio.begin(),
                 hparams.attn_compress_ratio.begin() + hparams.n_layer));
 
-        std::vector<uint32_t> recurrent_layers;
-        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-            if (hparams.is_recurrent(il)) {
-                recurrent_layers.push_back(il);
-            }
-        }
-        add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS, recurrent_layers);
-        if (recurrent_layers.empty()) {
-            add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
-        }
     }
     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,        hparams.hc_low_rank); // qwen4exp
 
