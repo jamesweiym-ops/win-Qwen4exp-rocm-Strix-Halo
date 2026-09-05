@@ -78,7 +78,11 @@ struct llama_model_loader {
     static const int TENSOR_DUPLICATED      = 1 << 1;
     static const int TENSOR_SKIP            = 1 << 2;
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
-    static const int TENSOR_READ_LAZY      = 1 << 5;
+    static const int TENSOR_NO_PREFETCH     = 1 << 4;
+    static const int TENSOR_READ_LAZY       = 1 << 5;
+
+    static bool should_exclude_from_prefetch(
+        int flags, bool use_mmap, enum llama_tensor_read_lazy lazy_mode, size_t tensor_bytes);
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -100,16 +104,7 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     // byte ranges of tensors that must not be prefetched during initial mmap
-    std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
-
-    bool has_lazy_tensor_ranges() const {
-        for (const auto & entry : lazy_tensor_ranges) {
-            if (!entry.second.empty()) {
-                return true;
-            }
-        }
-        return false;
-    }
+    std::map<uint32_t, llama_mmap::ranges> no_prefetch_tensor_ranges;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;

@@ -9,7 +9,9 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-memory-hybrid-idx.h"
 #include "../src/llama-model-saver.h"
+#include "../src/models/models.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -20,6 +22,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -79,7 +86,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--test-ple-error-boundary] [--test-ple-shared-input]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -93,7 +100,9 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(
+        const llm_arch arch, const bool moe, const bool qwen4exp_dense_attention = false,
+        const uint32_t qwen4exp_n_layer = 0) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 128;
@@ -103,6 +112,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
+    if (arch == LLM_ARCH_QWEN4EXP && qwen4exp_n_layer > 0) {
+        n_layer = qwen4exp_n_layer;
+    }
     if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA4) {
@@ -218,13 +230,6 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(64));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
-    if (arch == LLM_ARCH_QWEN4EXP) {
-        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
-        ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
-        // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
-    }
-
     // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
               arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(64));
@@ -236,6 +241,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,       uint32_t(1));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS, uint32_t(1));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPS,         1.0e-6f);
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        std::vector<uint32_t> compress_ratios(n_layer, 0);
+        for (uint32_t il = 1; il < n_layer; il += 2) {
+            compress_ratios[il] = 2;
+        }
+        if (!qwen4exp_dense_attention) {
+            ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios);
+        }
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,       uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,    uint32_t(32));
     }
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
@@ -325,7 +340,202 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 }
 
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false);
+
+#ifdef _WIN32
+struct temp_file_guard {
+    char path[MAX_PATH] = {};
+
+    temp_file_guard() {
+        char temp_dir[MAX_PATH] = {};
+        GGML_ASSERT(GetTempPathA(MAX_PATH, temp_dir) > 0);
+        GGML_ASSERT(GetTempFileNameA(temp_dir, "ple", 0, path) != 0);
+    }
+
+    ~temp_file_guard() { DeleteFileA(path); }
+};
+
+static void save_ple_test_model(
+        const char * path,
+        size_t seed,
+        const std::vector<uint32_t> & ple_layers,
+        uint64_t table_rows,
+        uint64_t head_vocab_size,
+        const std::vector<uint64_t> & multipliers,
+        bool vary_table_rows) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true, 3);
+    auto generated = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+
+    llama_model_saver saver(generated.first.get());
+    saver.add_kv_from_model();
+    saver.add_tensors_from_model();
+    saver.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,       uint32_t(4));
+    saver.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,      uint32_t(2));
+    saver.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,    std::vector<uint32_t>({0, 0, 0}));
+    saver.add_kv(LLM_KV_PLE_LAYERS,                   ple_layers);
+    saver.add_kv(LLM_KV_PLE_NGRAM_SIZE,               uint32_t(2));
+    saver.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,          uint32_t(1));
+    saver.add_kv(LLM_KV_PLE_CONV_KERNEL,              uint32_t(1));
+    saver.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,   uint32_t(256));
+    saver.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,        multipliers);
+    saver.add_kv(LLM_KV_PLE_HEAD_OFFSETS,             std::vector<uint64_t>({0}));
+    saver.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,         std::vector<uint64_t>({head_vocab_size}));
+    saver.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,             uint32_t(0));
+
+    ggml_init_params tensor_params = {4*1024*1024, nullptr, false};
+    ggml_context_ptr tensor_ctx(ggml_init(tensor_params));
+    const auto add_f16_tensor = [&](const std::string & name, int64_t ne0, int64_t ne1) {
+        ggml_tensor * tensor = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_F16, ne0, ne1);
+        ggml_set_name(tensor, name.c_str());
+        std::fill_n(
+            static_cast<ggml_fp16_t *>(tensor->data), ggml_nelements(tensor), ggml_fp32_to_fp16(0.01f));
+        saver.add_tensor(tensor);
+    };
+    const auto add_f32_tensor = [&](const std::string & name, int64_t ne0, int64_t ne1) {
+        ggml_tensor * tensor = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_F32, ne0, ne1);
+        ggml_set_name(tensor, name.c_str());
+        std::fill_n(static_cast<float *>(tensor->data), ggml_nelements(tensor), 0.01f);
+        saver.add_tensor(tensor);
+    };
+    for (uint32_t il : ple_layers) {
+        const std::string prefix = "blk." + std::to_string(il) + ".ple_";
+        add_f16_tensor(prefix + "key.weight",        256, 1024);
+        add_f16_tensor(prefix + "value.weight",      256, 256);
+        add_f32_tensor(prefix + "norm_key.weight",   1024, 1);
+        add_f32_tensor(prefix + "norm_query.weight", 1024, 1);
+        add_f32_tensor(prefix + "norm_conv.weight",  1024, 1);
+        add_f32_tensor(prefix + "conv1d.weight",     1, 1024);
+    }
+
+    ggml_tensor * ple = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_Q8_0, 256, table_rows);
+    ggml_set_name(ple, "per_layer_token_embd.weight");
+    std::vector<float> values(256 * table_rows, 0.25f);
+    if (vary_table_rows) {
+        for (uint64_t row = 0; row < table_rows; ++row) {
+            std::fill_n(values.data() + row * 256, 256, 0.02f * (float) (row + 1));
+        }
+    }
+    GGML_ASSERT(ggml_quantize_chunk(
+        GGML_TYPE_Q8_0, values.data(), ple->data, 0, table_rows, 256, nullptr) == ggml_nbytes(ple));
+    saver.add_tensor(ple);
+    saver.save(path);
+}
+
+static llama_model_ptr load_direct_ple_model(const char * path) {
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.ple_storage = LLAMA_PLE_STORAGE_DIRECT;
+    model_params.ple_io_depth = 2;
+    model_params.ple_buffer_size = 8192;
+    return llama_model_ptr(llama_model_load_from_file(path, model_params));
+}
+
+static llama_context_ptr make_ple_test_context(llama_model * model) {
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 16;
+    ctx_params.n_batch = 16;
+    ctx_params.n_ubatch = 16;
+    ctx_params.n_threads = 2;
+    ctx_params.n_threads_batch = 2;
+    return llama_context_ptr(llama_init_from_model(model, ctx_params));
+}
+
+static std::vector<float> decode_ple_token(
+        llama_model * model, llama_context * lctx, llama_token token, llama_pos pos) {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    common_batch_add(batch, token, pos, {0}, true);
+    GGML_ASSERT(llama_decode(lctx, batch) == 0);
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const float * logits = llama_get_logits_ith(lctx, 0);
+    std::vector<float> result(logits, logits + n_vocab);
+    llama_batch_free(batch);
+    return result;
+}
+
+static void test_ple_decode_exception_boundary(const size_t seed) {
+    temp_file_guard file;
+    // Deliberately make the declared vocabulary one larger than the four-row
+    // table. The model is loadable, but the second token below hashes to row 4
+    // and makes set_inputs() fail.
+    save_ple_test_model(file.path, seed, {0}, 4, 5, {1, 8}, true);
+
+    llama_model_ptr model = load_direct_ple_model(file.path);
+    GGML_ASSERT(model != nullptr);
+
+    llama_context_ptr lctx = make_ple_test_context(model.get());
+    GGML_ASSERT(lctx != nullptr);
+
+    decode_ple_token(model.get(), lctx.get(), 1, 0);
+    auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(lctx.get()));
+    GGML_ASSERT(memory != nullptr);
+    const auto history_before_empty_remove = memory->get_ple_histories().at(0);
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(lctx.get()), 0, 1, 1));
+    GGML_ASSERT(memory->get_ple_histories().at(0).next_pos == history_before_empty_remove.next_pos);
+    GGML_ASSERT(memory->get_ple_histories().at(0).toks == history_before_empty_remove.toks);
+    const auto history_before = memory->get_ple_histories().at(0);
+
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    common_batch_add(batch, 1, 1, {0}, true);
+
+    int decode_result = 0;
+    bool exception_escaped = false;
+    try {
+        decode_result = llama_decode(lctx.get(), batch);
+    } catch (const std::exception &) {
+        exception_escaped = true;
+    }
+    GGML_ASSERT(!exception_escaped);
+    GGML_ASSERT(decode_result == -3);
+
+    // A failed graph-input setup must follow the normal decode rollback path
+    // without consuming PLE history.
+    const auto & history_after = memory->get_ple_histories().at(0);
+    GGML_ASSERT(history_after.next_pos == history_before.next_pos);
+    GGML_ASSERT(history_after.toks == history_before.toks);
+
+    // Clearing through the public memory API must leave the context usable
+    // after the caught exception.
+    llama_batch_free(batch);
+    llama_memory_clear(llama_get_memory(lctx.get()), true);
+    decode_ple_token(model.get(), lctx.get(), 1, 0);
+}
+
+static void test_ple_shared_input_and_context_history(const size_t seed) {
+    temp_file_guard file;
+    save_ple_test_model(file.path, seed, {0, 2}, 16, 16, {1, 8}, true);
+
+    llama_model_ptr reference_model = load_direct_ple_model(file.path);
+    GGML_ASSERT(reference_model != nullptr);
+    llama_context_ptr reference_ctx = make_ple_test_context(reference_model.get());
+    GGML_ASSERT(reference_ctx != nullptr);
+    const auto reference_all = get_logits(reference_model.get(), reference_ctx.get(), {1, 3});
+    const size_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(reference_model.get()));
+    const std::vector<float> reference(reference_all.end() - n_vocab, reference_all.end());
+
+    llama_model_ptr shared_model = load_direct_ple_model(file.path);
+    GGML_ASSERT(shared_model != nullptr);
+    llama_context_ptr ctx_a = make_ple_test_context(shared_model.get());
+    llama_context_ptr ctx_b = make_ple_test_context(shared_model.get());
+    GGML_ASSERT(ctx_a != nullptr && ctx_b != nullptr);
+
+    const auto * qwen = dynamic_cast<const llama_model_qwen4exp *>(shared_model.get());
+    GGML_ASSERT(qwen != nullptr && qwen->ple_pager != nullptr);
+    const auto stats_before = qwen->ple_pager->snapshot_stats();
+
+    decode_ple_token(shared_model.get(), ctx_a.get(), 1, 0);
+    decode_ple_token(shared_model.get(), ctx_b.get(), 2, 0);
+    const auto actual = decode_ple_token(shared_model.get(), ctx_a.get(), 3, 1);
+
+    const auto stats_after = qwen->ple_pager->snapshot_stats();
+    // One PLE row per token, independent of the number of PLE layers.
+    GGML_ASSERT(stats_after.rows - stats_before.rows == 3);
+    // Context A must retain token 1 even though context B also uses sequence 0.
+    GGML_ASSERT(nmse(reference, actual) < 1e-10);
+}
+#endif
+
+static std::vector<float> get_logits(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
@@ -676,6 +886,8 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool test_ple_error_boundary = false;
+    bool test_ple_shared_input = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -711,6 +923,14 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "--test-ple-error-boundary") == 0) {
+            test_ple_error_boundary = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--test-ple-shared-input") == 0) {
+            test_ple_shared_input = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -718,6 +938,16 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
+#ifdef _WIN32
+        if (test_ple_error_boundary) {
+            test_ple_decode_exception_boundary(seed);
+            return 0;
+        }
+        if (test_ple_shared_input) {
+            test_ple_shared_input_and_context_history(seed);
+            return 0;
+        }
+#endif
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());

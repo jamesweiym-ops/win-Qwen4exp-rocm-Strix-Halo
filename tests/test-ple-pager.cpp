@@ -4,11 +4,13 @@
 #include "../ggml/src/ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #undef NDEBUG
@@ -111,8 +113,11 @@ int main() {
         constexpr uint64_t tensor_offset = 4096;
         constexpr size_t row_elements = 160;
         constexpr size_t row_bytes = 170;
-        constexpr size_t row_count = 40;
-        std::vector<uint8_t> file_bytes(16384, 0);
+        constexpr size_t row_count = 128;
+        // Keep EOF at the logical tensor end.  The final Q8_0 row is not
+        // sector-aligned, so direct I/O must accept the documented short
+        // completion of its final aligned request.
+        std::vector<uint8_t> file_bytes(tensor_offset + row_count * row_bytes, 0);
         std::vector<float> row(row_elements);
         std::vector<uint8_t> quantized(row_bytes);
         std::vector<float> expected_rows(row_count * row_elements);
@@ -140,11 +145,28 @@ int main() {
             row_bytes,
             4096,
         };
-        auto pager = llama_ple_pager::open_from_file_id(fd, test_source, 4, 8192);
+
+        const llama_ple_source truncated_source {
+            tensor_offset,
+            row_count * row_bytes + 1,
+            row_count,
+            row_elements,
+            row_bytes,
+            4096,
+        };
+        bool truncated_threw = false;
+        try {
+            (void) llama_ple_pager::open_from_file_id(fd, truncated_source, 4, 8192);
+        } catch (const std::exception &) {
+            truncated_threw = true;
+        }
+        assert(truncated_threw);
+
+        auto pager = llama_ple_pager::open_from_file_id(fd, test_source, 2, 32768);
         auto mmap_pager = llama_ple_pager::open_mmap_from_file_id(fd, test_source);
         _close(fd);
 
-        const std::vector<int32_t> requested = {0, 24, 24, 25};
+        const std::vector<int32_t> requested = {0, 5, 5, 6};
         std::vector<float> output(requested.size() * row_elements);
         pager->read_rows(requested, output.data(), output.size());
         for (size_t n = 0; n < requested.size(); ++n) {
@@ -153,9 +175,38 @@ int main() {
                 assert(std::abs(output[n * row_elements + i] - expected[i]) < 1e-6f);
             }
         }
+
+        // This row ends precisely at EOF, while its 4096-byte direct read
+        // extends beyond EOF.  Its logical data is nevertheless complete.
+        const std::vector<int32_t> final_requested = {(int32_t) row_count - 1};
+        std::vector<float> final_output(row_elements);
+        pager->read_rows(final_requested, final_output.data(), final_output.size());
+        const auto * final_expected = expected_rows.data() + (row_count - 1) * row_elements;
+        for (size_t i = 0; i < row_elements; ++i) {
+            assert(std::abs(final_output[i] - final_expected[i]) < 1e-6f);
+        }
+
+        // Keep all six sectors in one wave while forcing three I/O-depth
+        // batches.  Every requested byte should be scattered exactly once.
+        const std::vector<int32_t> scatter_requested = {0, 25, 49, 73, 97, 121, 127};
+        const auto scatter_plan = llama_ple_plan_rows(test_source, scatter_requested, 32768);
+        assert(scatter_plan.waves.size() == 1);
+        assert(scatter_plan.sectors.size() > 2);
+        std::vector<float> scatter_output(scatter_requested.size() * row_elements);
+        const auto scatter_before = pager->snapshot_stats();
+        pager->read_rows(scatter_requested, scatter_output.data(), scatter_output.size());
+        const auto scatter_after = pager->snapshot_stats();
+        assert(scatter_after.scatter_bytes - scatter_before.scatter_bytes == scatter_requested.size() * row_bytes);
+        for (size_t n = 0; n < scatter_requested.size(); ++n) {
+            const auto * expected = expected_rows.data() + (size_t) scatter_requested[n] * row_elements;
+            for (size_t i = 0; i < row_elements; ++i) {
+                assert(std::abs(scatter_output[n * row_elements + i] - expected[i]) < 1e-6f);
+            }
+        }
+
         bool invalid_threw = false;
         try {
-            pager->read_rows({row_count}, output.data(), output.size());
+            pager->read_rows({row_count}, output.data(), row_elements);
         } catch (const std::exception &) {
             invalid_threw = true;
         }
@@ -163,10 +214,61 @@ int main() {
         pager->read_rows({1}, output.data(), row_elements);
         assert(std::abs(output[0] - expected_rows[row_elements]) < 1e-6f);
         const auto stats = pager->snapshot_stats();
-        assert(stats.rows == requested.size() + 1);
+        assert(stats.rows == requested.size() + final_requested.size() + scatter_requested.size() + 1);
         assert(stats.bytes > 0);
         assert(stats.reads > 0);
         assert(stats.failures == 0);
+
+        // A direct pager owns one arena and one OVERLAPPED lane set.  Concurrent
+        // callers must not overwrite those shared resources mid-read.
+        constexpr int thread_count = 4;
+        constexpr int iterations = 64;
+        std::atomic<int> ready{0};
+        std::atomic<bool> start{false};
+        std::atomic<int> concurrent_failures{0};
+        std::vector<std::thread> workers;
+        workers.reserve(thread_count);
+        const auto concurrent_before = pager->snapshot_stats();
+        for (int thread_index = 0; thread_index < thread_count; ++thread_index) {
+            workers.emplace_back([&, thread_index]() {
+                const std::vector<int32_t> thread_rows = thread_index % 2 == 0
+                    ? std::vector<int32_t>{0, 25, 49}
+                    : std::vector<int32_t>{73, 97, 121};
+                std::vector<float> thread_output(thread_rows.size() * row_elements);
+                ready.fetch_add(1, std::memory_order_release);
+                while (!start.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (int iteration = 0; iteration < iterations; ++iteration) {
+                    try {
+                        pager->read_rows(thread_rows, thread_output.data(), thread_output.size());
+                    } catch (const std::exception &) {
+                        concurrent_failures.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    for (size_t n = 0; n < thread_rows.size(); ++n) {
+                        const auto * expected = expected_rows.data() + (size_t) thread_rows[n] * row_elements;
+                        for (size_t i = 0; i < row_elements; ++i) {
+                            if (std::abs(thread_output[n * row_elements + i] - expected[i]) >= 1e-6f) {
+                                concurrent_failures.fetch_add(1, std::memory_order_relaxed);
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        while (ready.load(std::memory_order_acquire) != thread_count) {
+            std::this_thread::yield();
+        }
+        start.store(true, std::memory_order_release);
+        for (auto & worker : workers) {
+            worker.join();
+        }
+        assert(concurrent_failures.load(std::memory_order_relaxed) == 0);
+        const auto concurrent_after = pager->snapshot_stats();
+        assert(concurrent_after.rows - concurrent_before.rows ==
+               (uint64_t) thread_count * iterations * 3);
 
         std::fill(output.begin(), output.end(), 0.0f);
         mmap_pager->read_rows(requested, output.data(), output.size());

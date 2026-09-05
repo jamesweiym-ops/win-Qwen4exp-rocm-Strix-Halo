@@ -5,7 +5,8 @@ param(
     [int] $Port = 18219,
     [int] $Context = 4096,
     [int] $MaxTokens = 32,
-    [double] $MaxWorkingSetGiB = 6
+    [ValidateRange(1, 64)] [double] $MaxWorkingSetGiB = 6,
+    [switch] $ApplyWorkingSetCap
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,7 +34,7 @@ try {
         '--ple-buffer-mib', '32',
         '--metrics'
     )
-    $server = Start-Process -FilePath $Binary -ArgumentList $arguments -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+    $server = Start-Process -FilePath $Binary -ArgumentList $arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
 
     $health = $false
     for ($i = 0; $i -lt 180; $i++) {
@@ -54,8 +55,17 @@ try {
         throw "server did not become healthy"
     }
 
+    $workingSetCapApplied = $false
+    $workingSetCapRequested = $ApplyWorkingSetCap -or $PSBoundParameters.ContainsKey('MaxWorkingSetGiB')
+    if ($workingSetCapRequested) {
+        $capScript = Join-Path $PSScriptRoot '..\set-windows-working-set.ps1'
+        $capOutput = & $capScript -Port $Port -MaxGiB $MaxWorkingSetGiB -WaitSeconds 30 | Out-String
+        Write-Verbose $capOutput
+        $workingSetCapApplied = $true
+    }
+
     $workingSetGiB = (Get-Process -Id $server.Id).WorkingSet64 / 1GB
-    if ($workingSetGiB -gt $MaxWorkingSetGiB) {
+    if ($workingSetCapApplied -and $workingSetGiB -gt $MaxWorkingSetGiB) {
         throw "working set after direct-PLE load is $([math]::Round($workingSetGiB, 2)) GiB, above $MaxWorkingSetGiB GiB"
     }
 
@@ -91,6 +101,7 @@ try {
         Port = $Port
         Content = $content
         WorkingSetGiB = [math]::Round($workingSetGiB, 3)
+        WorkingSetCapApplied = $workingSetCapApplied
         LogDirectory = $logRoot
         ServerPid = $server.Id
     } | ConvertTo-Json -Compress

@@ -198,6 +198,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    target_include_directories(test-llama-archs PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    if (WIN32)
+        llama_test(test-llama-archs NAME test-ple-decode-error-boundary ARGS --test-ple-error-boundary --seed 1)
+        llama_test(test-llama-archs NAME test-ple-shared-input         ARGS --test-ple-shared-input --seed 1)
+    endif()
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

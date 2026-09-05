@@ -1001,6 +1001,22 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
     return cur;
 }
 
+bool llama_model_loader::should_exclude_from_prefetch(
+        int flags, bool use_mmap, enum llama_tensor_read_lazy lazy_mode, size_t tensor_bytes) {
+    if (!use_mmap) {
+        return false;
+    }
+    if (flags & TENSOR_NO_PREFETCH) {
+        return true;
+    }
+    if (!(flags & TENSOR_READ_LAZY) || lazy_mode == LLAMA_TENSOR_READ_LAZY_OFF) {
+        return false;
+    }
+
+    constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
+    return lazy_mode == LLAMA_TENSOR_READ_LAZY_ON || tensor_bytes > auto_lazy_min_size;
+}
+
 // checks if the weight tensor can be used with the specified buffer type and device
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
@@ -1388,12 +1404,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     ggml_tensor * t_meta = get_tensor_meta(load_name.c_str());
 
-    if ((flags & TENSOR_READ_LAZY) && use_mmap && tensor_read_lazy != LLAMA_TENSOR_READ_LAZY_OFF) {
-        constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
-        if (tensor_read_lazy == LLAMA_TENSOR_READ_LAZY_ON || ggml_nbytes(t_meta) > auto_lazy_min_size) {
-            const auto & weight = require_weight(load_name.c_str());
-            lazy_tensor_ranges[weight.idx].emplace_back(weight.offs, weight.offs + ggml_nbytes(t_meta));
-        }
+    if (t_meta != nullptr && should_exclude_from_prefetch(
+            flags, use_mmap, tensor_read_lazy, ggml_nbytes(t_meta))) {
+        const auto & weight = require_weight(load_name.c_str());
+        no_prefetch_tensor_ranges[weight.idx].emplace_back(weight.offs, weight.offs + ggml_nbytes(t_meta));
     }
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
@@ -1494,10 +1508,12 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            static const llama_mmap::ranges no_lazy_ranges;
-            const auto it_lazy = lazy_tensor_ranges.find(file_idx);
-            const auto & lazy_ranges = it_lazy != lazy_tensor_ranges.end() ? it_lazy->second : no_lazy_ranges;
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa, lazy_ranges);
+            static const llama_mmap::ranges no_excluded_ranges;
+            const auto it_excluded = no_prefetch_tensor_ranges.find(file_idx);
+            const auto & excluded_ranges = it_excluded != no_prefetch_tensor_ranges.end()
+                ? it_excluded->second : no_excluded_ranges;
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(
+                file.get(), prefetch ? -1 : 0, is_numa, excluded_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

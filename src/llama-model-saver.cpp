@@ -289,6 +289,23 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,      hparams.indexer_n_head);
     add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,      hparams.indexer_head_size);
     add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,           hparams.indexer_top_k);
+    if (model->arch == LLM_ARCH_QWEN4EXP) {
+        add_kv(LLM_KV_HYPER_CONNECTION_COUNT,        hparams.n_hc);
+        add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(
+                hparams.attn_compress_ratio.begin(),
+                hparams.attn_compress_ratio.begin() + hparams.n_layer));
+
+        std::vector<uint32_t> recurrent_layers;
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (hparams.is_recurrent(il)) {
+                recurrent_layers.push_back(il);
+            }
+        }
+        add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS, recurrent_layers);
+        if (recurrent_layers.empty()) {
+            add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
+        }
+    }
     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,        hparams.hc_low_rank); // qwen4exp
 
     // the PLE group only means anything whole: write all of it or none
