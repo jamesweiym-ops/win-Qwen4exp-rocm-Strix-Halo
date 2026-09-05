@@ -528,6 +528,23 @@ static void test_ple_shared_input_and_context_history(const size_t seed) {
     GGML_ASSERT(stats_after.rows - stats_before.rows == 3);
     // Context A must retain token 1 even though context B also uses sequence 0.
     GGML_ASSERT(nmse(reference, actual) < 1e-10);
+
+    // PLE history is part of sequence state: restoring a context after token 1
+    // must produce the same PLE row for the following token as continuing it.
+    llama_model_ptr state_model = load_direct_ple_model(file.path);
+    GGML_ASSERT(state_model != nullptr);
+    llama_context_ptr state_source = make_ple_test_context(state_model.get());
+    llama_context_ptr state_target = make_ple_test_context(state_model.get());
+    GGML_ASSERT(state_source != nullptr && state_target != nullptr);
+    decode_ple_token(state_model.get(), state_source.get(), 1, 0);
+
+    const size_t state_size = llama_state_seq_get_size(state_source.get(), 0);
+    std::vector<uint8_t> state(state_size);
+    GGML_ASSERT(llama_state_seq_get_data(state_source.get(), state.data(), state.size(), 0) == state_size);
+    const auto expected_after_restore = decode_ple_token(state_model.get(), state_source.get(), 3, 1);
+    GGML_ASSERT(llama_state_seq_set_data(state_target.get(), state.data(), state.size(), 0) == state_size);
+    const auto actual_after_restore = decode_ple_token(state_model.get(), state_target.get(), 3, 1);
+    GGML_ASSERT(nmse(expected_after_restore, actual_after_restore) < 1e-10);
 }
 #endif
 

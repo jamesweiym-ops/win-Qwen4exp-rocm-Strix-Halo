@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid-idx.h"
 
 #include "llama-impl.h"
+#include "llama-io.h"
 #include "llama-batch.h"
 #include "llama-model.h"
 
@@ -8,6 +9,14 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
+
+namespace {
+
+constexpr uint32_t PLE_HISTORY_STATE_MAGIC   = 0x504C4548; // "PLEH"
+constexpr uint32_t PLE_HISTORY_STATE_VERSION = 1;
+
+}
 
 //
 // llama_memory_hybrid_idx
@@ -268,6 +277,93 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     }
 
     return mb;
+}
+
+void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id,
+                                          llama_state_seq_flags flags) const {
+    llama_memory_hybrid::state_write(io, seq_id, flags);
+
+    std::vector<llama_seq_id> seq_ids;
+    if (seq_id >= 0) {
+        if (ple_histories.find(seq_id) != ple_histories.end()) {
+            seq_ids.push_back(seq_id);
+        }
+    } else {
+        seq_ids.reserve(ple_histories.size());
+        for (const auto & entry : ple_histories) {
+            seq_ids.push_back(entry.first);
+        }
+        std::sort(seq_ids.begin(), seq_ids.end());
+    }
+
+    const uint32_t magic   = PLE_HISTORY_STATE_MAGIC;
+    const uint32_t version = PLE_HISTORY_STATE_VERSION;
+    const uint32_t n_seq   = (uint32_t) seq_ids.size();
+
+    io.write(&magic,   sizeof(magic));
+    io.write(&version, sizeof(version));
+    io.write(&n_seq,   sizeof(n_seq));
+
+    for (const llama_seq_id id : seq_ids) {
+        const auto & history = ple_histories.at(id);
+        const uint32_t n_toks = (uint32_t) history.toks.size();
+
+        io.write(&id,          sizeof(id));
+        io.write(&history.next_pos, sizeof(history.next_pos));
+        io.write(&n_toks,      sizeof(n_toks));
+        if (n_toks > 0) {
+            io.write(history.toks.data(), (size_t) n_toks * sizeof(history.toks[0]));
+        }
+    }
+}
+
+void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id,
+                                         llama_state_seq_flags flags) {
+    llama_memory_hybrid::state_read(io, seq_id, flags);
+
+    uint32_t magic;
+    uint32_t version;
+    uint32_t n_seq;
+
+    io.read(&magic,   sizeof(magic));
+    io.read(&version, sizeof(version));
+    io.read(&n_seq,   sizeof(n_seq));
+
+    if (magic != PLE_HISTORY_STATE_MAGIC) {
+        throw std::runtime_error("failed to restore Qwen4Exp PLE history: bad magic");
+    }
+    if (version != PLE_HISTORY_STATE_VERSION) {
+        throw std::runtime_error("failed to restore Qwen4Exp PLE history: bad version");
+    }
+
+    if (seq_id < 0) {
+        ple_histories.clear();
+    } else {
+        ple_histories.erase(seq_id);
+    }
+
+    for (uint32_t i = 0; i < n_seq; ++i) {
+        llama_seq_id source_id;
+        llama_ple_history history;
+        uint32_t n_toks;
+
+        io.read(&source_id,       sizeof(source_id));
+        io.read(&history.next_pos, sizeof(history.next_pos));
+        io.read(&n_toks,           sizeof(n_toks));
+
+        // PLE history is bounded by the model's n-gram setting.  Reject a
+        // corrupt state before allocating attacker-controlled memory.
+        if (n_toks > 1u << 20) {
+            throw std::runtime_error("failed to restore Qwen4Exp PLE history: unreasonable token count");
+        }
+        history.toks.resize(n_toks);
+        if (n_toks > 0) {
+            io.read(history.toks.data(), (size_t) n_toks * sizeof(history.toks[0]));
+        }
+
+        const llama_seq_id dest_id = seq_id >= 0 ? seq_id : source_id;
+        ple_histories[dest_id] = std::move(history);
+    }
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
